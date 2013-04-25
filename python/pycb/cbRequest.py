@@ -1,0 +1,924 @@
+import os
+import sys
+import time
+from time import strftime
+import stat
+import hashlib
+from xml.dom.minidom import Document, parseString
+import uuid
+from datetime import date, datetime
+from twisted.internet import reactor, defer
+from pycb.cbException import cbException
+import time
+import pycb
+import logging
+import traceback
+import base64
+import tempfile
+from twisted.protocols.basic import FileSender
+from twisted.python.log import err
+import twisted.web.http
+from pynimbusauthz.user import User
+from twisted.python import log
+
+
+#
+#  possible request types
+#
+
+perms_strings = {}
+perms_strings['FULL_CONTROL'] = "WRrw"
+perms_strings['WRITE'] = "w"
+perms_strings['WRITE_ACP'] = "W"
+perms_strings['READ_ACP'] = "R"
+perms_strings['READ'] = "r"
+
+def perm2string(p):
+    pycb.log(logging.INFO, "===== def perm2string of cbRequest.py")
+    global perms_strings
+    for (k, v) in perms_strings.iteritems():
+        if p == v:
+            return k
+    return None
+
+def getText(nodelist):
+    pycb.log(logging.INFO, "===== def getText of cbRequest.py")
+    rc = ""
+    for node in nodelist:
+        if node.nodeType == node.TEXT_NODE:
+            rc = rc + node.data
+    return rc
+
+def parse_acl_request(xml):
+    pycb.log(logging.INFO, "===== def parse_acl_request of cbRequest.py")
+    dom = parseString(xml)
+    grant_a = dom.getElementsByTagName("Grant")
+    grants = []
+    users = {}
+
+    for g in grant_a:
+        el = g.getElementsByTagName("URI")
+        if el != None and len(el) >= 1:
+            u = getText(el[0].childNodes)
+            if u == "http://acs.amazonaws.com/groups/global/AllUsers":
+                id = "CumulusPublicUser"
+                email = ""
+            else:
+                raise cbException('InvalidArgument')
+        else:
+            el = g.getElementsByTagName("DisplayName")
+            if el == None or len(el) < 1:
+                email = None
+            else:
+                email = getText(el[0].childNodes)
+            id = getText(g.getElementsByTagName("ID")[0].childNodes)
+        perm_set = g.getElementsByTagName("Permission")
+
+        perms = ""
+        for p in perm_set:
+            requested_perm = getText(p.childNodes)
+
+            if requested_perm not in perms_strings:
+                raise cbException('InvalidArgument')
+
+            pv = perms_strings[requested_perm]
+            ndx = perms.find(pv)
+            if ndx < 0:
+                perms = perms + pv
+
+        if id in users.keys():
+            (i, e, p) = users[id]
+            perms = perms + p
+        users[id] = (id, email, perms)
+
+    return users.values()
+
+
+class cbRequest(object):
+
+    def __init__(self, request, user, requestId, bucketIface):
+        self.bucketName = None
+        self.objectName = None
+        self.request = request
+        self.user = user
+        self.requestId = requestId
+        self.bucketIface = bucketIface
+        self.dataObject = None
+
+        self.outGoingHeaders = {}
+        self.responseCode = None
+        self.responseMsg = None
+
+        self.get_opts()
+
+    def build_grant_acl(self, doc, acl_node, p, user_id, email):
+        pycb.log(logging.INFO, "===== def build_grant_acl of cbRequest.py")
+        grant_node = doc.createElement("Grant")
+        acl_node.appendChild(grant_node)
+
+        grantee_node = doc.createElement("Grantee")
+        grant_node.appendChild(grantee_node)
+        id = doc.createElement("ID")
+        grantee_node.appendChild(id)
+        idText = doc.createTextNode(str(user_id))
+        id.appendChild(idText)
+        grantee_node.setAttribute("xmlns:xsi", "http://www.w3.org/2001/XMLSchema-instance")
+        grantee_node.setAttribute("xsi:type", "CanonicalUser")
+
+        dN = doc.createElement("DisplayName")
+        grantee_node.appendChild(dN)
+        dNText = doc.createTextNode(email)
+        dN.appendChild(dNText)
+        permsN = doc.createElement("Permission")
+        grant_node.appendChild(permsN)
+        permsNText = doc.createTextNode(p)
+        permsN.appendChild(permsNText)
+
+    def get_acl_xml(self):
+        pycb.log(logging.INFO, "===== def get_acl_xml of cbRequest.py")
+        (owner_id,owner_email) = self.user.get_owner(self.bucketName, self.objectName)
+        acl = self.user.get_acl(self.bucketName, self.objectName)
+        doc = Document()
+
+        # Create the <wml> base element
+        listAll = doc.createElement("AccessControlPolicy")
+        doc.appendChild(listAll)
+
+        # Create the main <card> element
+        owner = doc.createElement("Owner")
+        listAll.appendChild(owner)
+
+        id = doc.createElement("ID")
+        owner.appendChild(id)
+        idText = doc.createTextNode(str(owner_id))
+        id.appendChild(idText)
+
+        dN = doc.createElement("DisplayName")
+        owner.appendChild(dN)
+        dNText = doc.createTextNode(owner_email)
+        dN.appendChild(dNText)
+
+        acl_node = doc.createElement("AccessControlList")
+        listAll.appendChild(acl_node)
+
+        for a in acl:
+            user_id = a[0]
+            email = a[1]
+            perms = a[2]
+
+            if len(perms) == 4 and 'w' in perms and 'r' in perms and 'R' in perms and 'W' in perms:
+                self.build_grant_acl(doc,acl_node,'FULL_CONTROL',user_id,email)
+            else:
+                for p in perms:
+                    perms_str = perm2string(p)
+                    self.build_grant_acl(doc,acl_node,perms_str,user_id,email)
+
+        x = doc.toxml();
+
+        return x
+
+    def get_opts(self):
+        pycb.log(logging.INFO, "===== def get_opts of cbRequest.py")
+        self.acl = False
+        # deal with the uri to args bidnes
+        opts_a = self.request.uri.split('?', 1)
+        if len(opts_a) == 1:
+            return
+        all_opts = opts_a[1].strip()
+        opts_a = all_opts.split('&')
+        for opt in opts_a:
+            if opt == "acl":
+                self.acl = True
+
+    def setHeader(self, request, k, v):
+        pycb.log(logging.INFO, "===== def setHeader of cbRequest.py")
+        request.setHeader(k, v)
+        self.outGoingHeaders[k] = v
+
+    def setResponseCode(self, request, code, msg):
+        pycb.log(logging.INFO, "===== def setResponseCode of cbRequest.py")
+        request.setResponseCode(code, msg)
+        self.responseCode = code
+        self.responseMsg = msg
+
+    def finish(self, request):
+        pycb.log(logging.INFO, "===== def finish of cbRequest.py")
+        pycb.log(logging.INFO, "=====## %s %s Reply sent %d %s" % (self.requestId, str(datetime.now()), self.responseCode, self.responseMsg))
+        pycb.log(logging.INFO, "=====## "+str(self.outGoingHeaders))
+        pycb.log(logging.INFO, "=====## request is %s"%request)
+        request.finish()
+
+    def set_common_headers(self):
+        pycb.log(logging.INFO, "===== def set_common_headers of cbRequest.py")
+        amzid2 = str(uuid.uuid1()).replace("-", "")
+        self.setHeader(self.request, 'x-amz-id-2', amzid2)
+        self.setHeader(self.request,'x-amz-request-id', self.requestId)
+        self.setHeader(self.request, 'Server', "cumulus")
+        tm = datetime.utcnow()
+        tmstr = tm.strftime("%a, %d %b %Y %H:%M:%S GMT")
+        self.setHeader(self.request, 'date', tmstr)
+
+    def send_xml(self, x):
+        pycb.log(logging.INFO, "===== def send_xml of cbRequest.py")
+        xLen = len(x)
+        self.set_common_headers()
+        self.setHeader(self.request, 'Content-Length', str(xLen))
+        self.setHeader(self.request, 'Connection', 'close')
+        self.setResponseCode(self.request, 200, 'OK')
+        self.request.write(x)
+        pycb.log(logging.INFO, "Sent %s" % (x))
+
+
+    def set_no_content_header(self):
+        pycb.log(logging.INFO, "===== def set_no_content_header of cbRequest.py")
+        self.set_common_headers()
+        self.setHeader(self.request, 'Connection', 'close')
+        self.setHeader(self.request, 'Content-Length', "0")
+        self.setResponseCode(self.request, 204, 'No Content')
+
+    # effectively there is no public user because you must be authorized to
+    # do anything at all with cumulus
+    def grant_public_permissions(self, bucketName, objectName):
+        pycb.log(logging.INFO, "===== def grant_public_permissions of cbRequest.py")
+        user = self.user
+        headers = self.request.getAllHeaders()
+        if 'x-amz-acl' not in headers:
+            return False
+        put_perms = headers['x-amz-acl']
+
+        if put_perms == 'public-read':
+            perms = "r"
+            (set_user_name, fn) = (pycb.public_user_id, pycb.public_user_id)
+        elif put_perms == 'public-read-write':
+            perms = "rw"
+            (set_user_name, fn) = (pycb.public_user_id, pycb.public_user_id)
+        elif put_perms == 'authenticated-read':
+            (set_user_name, fn) = (pycb.authenticated_user_id, pycb.authenticated_user_id)
+            perms = "r"
+        elif put_perms == 'bucket-owner-read':
+            # only makes sense for an object
+            if objectName == None:
+                return
+            perms = "r"
+            (set_user_name, fn) = user.get_owner(bucketName)
+        elif put_perms == 'bucket-owner-full-control':
+            # only makes sense for an object
+            if objectName == None:
+                return
+            perms = "rRwW"
+            (set_user_name, fn) = user.get_owner(bucketName)
+        else:
+            # act all like private
+            perms = "rRwW"
+            set_user_name = user.get_id()
+            fn = user.get_display_name()
+        if set_user_name == user.get_id():
+            # nothing to do in this case
+            return True
+        user.grant(set_user_name, bucketName, objectName, perms)
+        return True
+
+class cbGetService(cbRequest):
+
+    def __init__(self, request, user, requestId, bucketIface):
+        cbRequest.__init__(self, request, user, requestId, bucketIface)
+
+    def work(self):
+        pycb.log(logging.INFO, "===== def work of cbRequest.py")
+        dirL = self.user.get_my_buckets()
+        request = self.request
+        doc = Document()
+
+        self.setHeader(request, "content-type", "application/xml")
+        # Create the <xml> base element
+        listAll = doc.createElement("ListAllMyBucketsResult")
+        listAll.setAttribute("xmlns", "http://doc.s3.amazonaws.com/2006-03-01")
+        doc.appendChild(listAll)
+
+        # Create the main <card> element
+        owner = doc.createElement("Owner")
+        listAll.appendChild(owner)
+
+        id = doc.createElement("ID")
+        owner.appendChild(id)
+        idText = doc.createTextNode(str(self.user.get_id()))
+        id.appendChild(idText)
+
+        dN = doc.createElement("DisplayName")
+        owner.appendChild(dN)
+        dNText = doc.createTextNode(str(self.user.get_display_name()))
+        dN.appendChild(dNText)
+
+        buckets = doc.createElement("Buckets")
+        listAll.appendChild(buckets)
+
+        for obj in dirL:
+            bucketOne = doc.createElement("Bucket")
+            buckets.appendChild(bucketOne)
+
+            nameOne = doc.createElement("Name")
+            bucketOne.appendChild(nameOne)
+            nameText = doc.createTextNode(str(obj.get_key()))
+            nameOne.appendChild(nameText)
+            dateOne = doc.createElement("CreationDate")
+            bucketOne.appendChild(dateOne)
+            dateText = doc.createTextNode(str(obj.get_date_string()))
+            dateOne.appendChild(dateText)
+
+        x = doc.toxml();
+        self.send_xml(x)
+        self.finish(self.request)
+
+class cbGetBucket(cbRequest):
+
+    def __init__(self, request, user, bucket, requestId, bucketIface):
+        cbRequest.__init__(self, request, user, requestId, bucketIface)
+        self.bucketName = bucket
+
+    def work(self):
+        pycb.log(logging.INFO, "===== def work of cbRequest.py")
+        exists = self.user.exists(self.bucketName)
+        if not exists:
+            raise cbException('NoSuchBucket')
+        (perms, data_key) = self.user.get_perms(self.bucketName)
+        if self.acl:
+            ndx = perms.find("R")
+            if ndx < 0:
+                raise cbException('AccessDenied')
+            else:
+                self.get_acl()
+        else:
+            ndx = perms.find("r")
+            if ndx < 0:
+                raise cbException('AccessDenied')
+            else:
+                self.list_bucket()
+
+    def get_acl(self):
+        pycb.log(logging.INFO, "===== def get_acl of cbRequest.py")
+        payload = self.get_acl_xml()
+        pycb.log(logging.INFO, "GET BUCKET ACL XML %s" % (payload))
+        self.send_xml(payload)
+        self.finish(self.request)
+
+    def get_location(self):
+        pycb.log(logging.INFO, "===== def get_location of cbRequest.py")
+        doc = Document()
+        xList = doc.createElement("LocationConstraint")
+        xList.setAttribute("xmlns", "http://doc.s3.amazonaws.com/2006-03-01")
+        xNameText = doc.createTextNode(pycb.config.location)
+        xList.appendChild(xNameText)
+        doc.appendChild(xList)
+        x = doc.toxml();
+        self.send_xml(x)
+        self.finish(self.request)
+
+    def list_bucket(self):
+        pycb.log(logging.INFO, "===== def list_bucket of cbRequest.py")
+        dirL = self.user.list_bucket(self.bucketName, self.request.args)
+        doc = Document()
+
+        # Create the <wml> base element
+        xList = doc.createElement("ListBucketResult")
+        xList.setAttribute("xmlns", "http://doc.s3.amazonaws.com/2006-03-01")
+        doc.appendChild(xList)
+
+        # Create the main <card> element
+        xName = doc.createElement("Name")
+        xList.appendChild(xName)
+        xNameText = doc.createTextNode(str(self.bucketName))
+        xName.appendChild(xNameText)
+
+        xIsTruncated = doc.createElement("IsTruncated")
+        xList.appendChild(xIsTruncated)
+        xIsTText = doc.createTextNode('false')
+        xIsTruncated.appendChild(xIsTText)
+
+        for obj in dirL:
+            xObj = obj.create_xml_element(doc)
+            xList.appendChild(xObj)
+
+        x = doc.toxml();
+
+        self.send_xml(x)
+        self.finish(self.request)
+
+class cbGetObject(cbRequest):
+
+    def __init__(self, request, user, bucketName, objName, requestId, bucketIface):
+        cbRequest.__init__(self, request, user, requestId, bucketIface)
+        self.bucketName = bucketName
+        self.objectName = objName
+
+    def work(self):
+        pycb.log(logging.INFO, "===== def work of cbRequest.py")
+        exists = self.user.exists(self.bucketName, self.objectName)
+        if not exists:
+            raise cbException('NoSuchKey')
+        (perms, data_key) = self.user.get_perms(self.bucketName, self.objectName)
+        if self.acl:
+            ndx = perms.find("R")
+            if ndx < 0:
+                raise cbException('AccessDenied')
+            else:
+                self.get_acl()
+        else:
+            ndx = perms.find("r")
+            if ndx < 0:
+                raise cbException('AccessDenied')
+            else:
+                obj = self.bucketIface.get_object(data_key)
+                self.sendObject(obj)
+
+    def get_acl(self):
+        pycb.log(logging.INFO, "===== def get_acl of cbRequest.py")
+        payload = self.get_acl_xml()
+        pycb.log(logging.INFO, "GET BUCKET ACL XML %s" % (payload))
+        self.send_xml(payload)
+        self.finish(self.request)
+
+    def calcMd5Sum(self, dataObj):
+        pycb.log(logging.INFO, "===== def calcMd5Sum of cbRequest.py")
+        md5obj = self.bucketIface.get_object(dataObj.getDataKey())
+        md5er = hashlib.md5()
+        done = False
+        while not done:
+            b = md5obj.read()
+            if len(b) > 0:
+                md5er.update(b)
+            else:
+                done = True
+        md5obj.close()
+        etag = str(md5er.hexdigest()).strip()
+        return etag
+
+
+#    def sendFile(self, dataObj):
+#        pycb.log(logging.INFO, "===== def sendFile of cbRequest.py")
+#        try:
+#            etag = dataObj.get_md5()
+#            if etag == None:
+#                etag = self.etag
+#            if etag == None:
+#                etag = self.calcMd5Sum(dataObj)
+#                dataObj.set_md5(etag)
+#            self.setHeader(self.request, 'ETag', '"%s"' % (etag))
+#            self.setResponseCode(self.request, 200, 'OK')
+#
+#            fp = dataObj
+#            d = FileSender().beginFileTransfer(fp, self.request)
+#            def cbFinished(ignored):
+#                pycb.log(logging.INFO, "===== def cbFinished of cbRequest.py")
+#                fp.close()
+#                self.request.finish()
+#            d.addErrback(err).addCallback(cbFinished)
+#
+#        except cbException, (ex):
+#            ex.sendErrorResponse(self.request, self.requestId)
+#            traceback.print_exc(file=sys.stdout)
+#            pycb.log(logging.ERROR, "Error sending file %s" % (str(ex)), traceback)
+#        except Exception, ex2:
+#            traceback.print_exc(file=sys.stdout)
+#            gdEx = cbException('InvalidArgument')
+#            gdEx.sendErrorResponse(self.request, self.requestId)
+#            pycb.log(logging.ERROR, "Error sending file %s" % (str(ex2)), traceback)
+            
+    def sendFile(self, dataObj):
+        pycb.log(logging.INFO, "===== def sendFile of cbRequest.py")
+        try:
+            #etag = dataObj.get_md5()
+            etag = pycb.config.bucket.get_md5()
+            pycb.log(logging.INFO, "=====## md5(etag) is %s"%etag)
+            if etag == None:
+                etag = self.etag
+            if etag == None:
+                etag = self.calcMd5Sum(dataObj)
+                dataObj.set_md5(etag)
+            self.setHeader(self.request, 'ETag', '"%s"' % (etag))
+            self.setResponseCode(self.request, 200, 'OK')
+
+            fp = dataObj
+            d = FileSender().beginFileTransfer(fp, self.request)
+            def cbFinished(ignored):
+                pycb.log(logging.INFO, "===== def cbFinished of cbRequest.py")
+                fp.close()
+                self.request.finish()
+            d.addErrback(err).addCallback(cbFinished)
+
+        except cbException, (ex):
+            ex.sendErrorResponse(self.request, self.requestId)
+            traceback.print_exc(file=sys.stdout)
+            pycb.log(logging.ERROR, "Error sending file %s" % (str(ex)), traceback)
+        except Exception, ex2:
+            traceback.print_exc(file=sys.stdout)
+            gdEx = cbException('InvalidArgument')
+            gdEx.sendErrorResponse(self.request, self.requestId)
+            pycb.log(logging.ERROR, "Error sending file %s" % (str(ex2)), traceback)
+
+
+    def sendObject(self, dataObj):
+        pycb.log(logging.INFO, "===== def sendObject of cbRequest.py")
+        request = self.request
+        self.dataObj = dataObj
+
+        self.set_common_headers()
+        self.setHeader(request, 'Content-Type', 'binary/octet-stream')
+        self.setHeader(request, 'Content-Length', str(dataObj.get_size()))
+
+        (s,ct,self.etag) = self.user.get_info(self.bucketName, self.objectName)
+
+        reactor.callInThread(self.sendFile, dataObj)
+
+class cbDeleteBucket(cbRequest):
+
+    def __init__(self, request, user, bucketName, requestId, bucketIface):
+        cbRequest.__init__(self, request, user, requestId, bucketIface)
+        self.bucketName = bucketName
+
+    def work(self):
+        pycb.log(logging.INFO, "===== def work of cbRequest.py")
+        exists = self.user.exists(self.bucketName)
+        if not exists:
+            raise cbException('NoSuchBucket')
+        (perms, data_key) = self.user.get_perms(self.bucketName)
+        ndx = perms.find("w")
+        if ndx < 0:
+            raise cbException('AccessDenied')
+        self.deleteIt(data_key)
+
+    def deleteIt(self, data_key):
+        pycb.log(logging.INFO, "===== def deleteIt of cbRequest.py")
+        self.set_no_content_header()
+        self.user.delete_bucket(self.bucketName)
+        self.finish(self.request)
+
+class cbDeleteObject(cbRequest):
+
+    def __init__(self, request, user, bucketName, objName, requestId, bucketIface):
+        cbRequest.__init__(self, request, user, requestId, bucketIface)
+        self.bucketName = bucketName
+        self.objectName = objName
+
+    def work(self):
+        pycb.log(logging.INFO, "===== def work of cbRequest.py")
+        exists = self.user.exists(self.bucketName, self.objectName)
+        if not exists:
+            raise cbException('NoSuchKey')
+
+        (perms, data_key) = self.user.get_perms(self.bucketName, self.objectName)
+        ndx = perms.find("w")
+        if ndx < 0:
+            raise cbException('AccessDenied')
+        else:
+            self.deleteIt(data_key)
+
+    def deleteIt(self, data_key):
+        pycb.log(logging.INFO, "===== def deleteIt of cbRequest.py")
+        request = self.request
+        self.set_no_content_header()
+        self.bucketIface.delete_object(data_key)
+        self.user.delete_object(self.bucketName, self.objectName)
+        self.finish(request)
+
+class cbPutBucket(cbRequest):
+
+    def __init__(self, request, user, bucketName, requestId, bucketIface):
+        cbRequest.__init__(self, request, user, requestId, bucketIface)
+        self.bucketName = bucketName
+
+    def work(self):
+        pycb.log(logging.INFO, "===== def work of cbRequest.py")
+        request = self.request
+        exists = self.user.exists(self.bucketName)
+
+        if self.acl:
+            if not exists:
+                raise cbException('NoSuchBucket')
+            (perms, data_key) = self.user.get_perms(self.bucketName)
+            ndx = perms.find("W")
+            if ndx < 0:
+                raise cbException('AccessDenied')
+
+            rc = self.grant_public_permissions(self.bucketName, self.objectName)
+            if not rc:
+                xml = self.request.content.read()
+                pycb.log(logging.INFO, "xml %s" % (xml))
+                grants = parse_acl_request(xml)
+                for g in grants:
+                    pycb.log(logging.INFO, "granting %s to %s" % (g[2], g[0]))
+                    self.user.grant(g[0], self.bucketName, perms=g[2])
+        else:
+            if exists:
+                raise cbException('BucketAlreadyExists')
+            self.user.put_bucket(self.bucketName)
+            self.grant_public_permissions(self.bucketName, self.objectName)
+
+        self.set_common_headers()
+        self.setHeader(request, 'Content-Length', 0)
+        self.setHeader(request, 'Connection', 'close')
+        self.setHeader(request, 'Location', "/" + self.bucketName)
+        self.setResponseCode(request, 200, 'OK')
+
+        self.finish(request)
+
+class cbPutObject(cbRequest):
+
+    def __init__(self, request, user, bucketName, objName, requestId, bucketIface):
+        cbRequest.__init__(self, request, user, requestId, bucketIface)
+        ndx = objName.find("cumulus:/")
+        if ndx >= 0:
+            pycb.log(logging.ERROR, "someone tried to make a key named cumulus://... why would someone do that? %d" % (ndx))
+            raise cbException('InvalidURI')
+
+        self.checkMD5 = None
+        self.bucketName = bucketName
+        self.objectName = objName
+
+    def work(self):
+        pycb.log(logging.INFO, "===== def work of cbRequest.py")
+        dataObj = self.request.content
+        exists = self.user.exists(self.bucketName, self.objectName)
+        if self.acl:
+            if not exists:
+                raise cbException('NoSuchKey')
+            (perms, data_key) = self.user.get_perms(self.bucketName, self.objectName)
+            ndx = perms.find("W")
+            if ndx < 0:
+                raise cbException('AccessDenied')
+
+            rc = self.grant_public_permissions(self.bucketName, self.objectName)
+            if not rc:
+                xml = self.request.content.read()
+                pycb.log(logging.ERROR, "acl xml %s" % (xml))
+                grants = parse_acl_request(xml)
+                for g in grants:
+                    pycb.log(logging.INFO, "granting %s to %s" % (g[2], g[0]))
+                    self.user.grant(g[0], self.bucketName, self.objectName, perms=g[2])
+
+            self.set_common_headers()
+            self.setHeader(self.request, 'Content-Length', 0)
+            self.setHeader(self.request, 'Connection', 'close')
+            self.setHeader(self.request, 'Location', "/" + self.bucketName)
+            self.setResponseCode(self.request, 200, 'OK')
+            self.finish(self.request)
+        else:
+            (bperms, bdata_key) = self.user.get_perms(self.bucketName)
+            ndx = bperms.find("w")
+            if ndx < 0:
+                raise cbException('AccessDenied')
+
+            file_size = 0
+            if exists:
+                (perms, data_key) = self.user.get_perms(self.bucketName, self.objectName)
+                ndx = perms.find("w")
+                if ndx < 0:
+                    raise cbException('AccessDenied')
+
+                # make sure they can write to the bucket
+                (perms, data_key) = self.user.get_perms(self.bucketName)
+                ndx = perms.find("w")
+                if ndx < 0:
+                    raise cbException('AccessDenied')
+                (file_size, ctm, md5) = self.user.get_info(self.bucketName, self.objectName)
+
+            # gotta decide quota, if existed should get credit for the
+            # existing size
+            remaining_quota = self.user.get_remaining_quota()
+            if remaining_quota != User.UNLIMITED:
+                new_file_len = int(self.request.getHeader('content-length'))
+                if remaining_quota + file_size < new_file_len:
+                    pycb.log(logging.INFO, "user %s did not pass quota.  file size %d quota %d" % (self.user, new_file_len, remaining_quota))
+                    raise cbException('AccountProblem')
+
+            obj = self.request.content
+            self.recvObject(self.request, obj)
+
+
+    def endGet(self, dataObj):
+        pycb.log(logging.INFO, "===== def endGet of cbRequest.py")
+        try:
+            if pycb.config.backend=="hdfs":
+                pycb.log(logging.INFO, "=====## dataObj is %s"%dataObj)
+                #eTag = dataObj.get_md5()
+                eTag=pycb.config.bucket.md5.hexdigest()
+                pycb.log(logging.INFO, "=====## eTag is %s"%eTag)
+                mSum = base64.encodestring(base64.b16decode(eTag.upper()))
+                self.checkMD5 = mSum
+
+                pycb.log(logging.INFO, "sent %s etag %s" % (self.objectName, self.checkMD5))
+                self.setHeader(self.request, 'ETag', '"%s"' % (eTag))
+
+                #dataObj.set_delete_on_close(False)
+                
+                self.finish(self.request)
+            else:
+                eTag = dataObj.get_md5()
+                pycb.log(logging.INFO, "=====## eTag is "+eTag)
+    
+                
+                mSum = base64.encodestring(base64.b16decode(eTag.upper()))
+                self.checkMD5 = mSum
+    
+                pycb.log(logging.INFO, "sent %s etag %s" % (self.objectName, self.checkMD5))
+                self.setHeader(self.request, 'ETag', '"%s"' % (eTag))
+    
+                # now that we have the file set delete on close to false
+                # it will now be safe to deal with dropped connections
+                # without having large files left around
+                dataObj.set_delete_on_close(False)
+                # dataObj.close() do no need to close for now.  twisted will
+                # do this for us
+                self.user.put_object(dataObj, self.bucketName, self.objectName)
+                self.grant_public_permissions(self.bucketName, self.objectName)
+                #pycb.log(logging.INFO, "=====## check")
+                self.finish(self.request)
+        except cbException, (ex):
+            pycb.log(logging.INFO, "=====## cbException")
+            ex.sendErrorResponse(self.request, self.requestId)
+        except:
+            pycb.log(logging.INFO, "=====## except")
+            traceback.print_exc(file=sys.stdout)
+            gdEx = cbException('InvalidArgument')
+            gdEx.sendErrorResponse(self.request, self.requestId)
+
+    #  receive object looks strange because twisted has already received
+    #  the entire file and put it in a temp location.  we now just have
+    #  to recognize that we have it all
+    def recvObject(self, request, dataObj):
+        pycb.log(logging.INFO, "===== def recvObject of cbRequest.py")
+        self.set_common_headers()
+        self.setHeader(request, 'Connection', 'close')
+        self.setHeader(request, 'Content-Length', 0)
+        self.setResponseCode(request, 200, 'OK')
+        self.dataObj = dataObj
+        self.block_size = 1024*256
+
+        headers = request.getAllHeaders()
+        for (k,v) in headers.iteritems():
+            kl = k.lower()
+            if kl == 'content-md5':
+                self.checkMD5 = v
+            elif kl == 'x-amz-acl':
+                self.put_perms = v
+
+        self.endGet(dataObj)
+
+
+class cbHeadObject(cbGetObject):
+
+    def __init__(self, request, user, bucketName, objName, requestId, bucketIface):
+        cbRequest.__init__(self, request, user, requestId, bucketIface)
+        self.bucketName = bucketName
+        self.objectName = objName
+
+    def work(self):
+        pycb.log(logging.INFO, "===== def work of cbRequest.py")
+        (perms, data_key) = self.user.get_perms(self.bucketName, self.objectName)
+
+        ndx = perms.find("r")
+        if ndx < 0:
+            raise cbException('AccessDenied')
+        (sz, tm, md5) = self.user.get_info(self.bucketName, self.objectName)
+
+        d_str = "%04d-%02d-%02dT%02d:%02d:%02d.000Z" % (tm.tm_year, tm.tm_mon, tm.tm_wday, tm.tm_hour, tm.tm_min, tm.tm_sec)
+
+        self.set_common_headers()
+        self.setHeader(self.request, 'Content-Type', 'binary/octet-stream')
+        self.setHeader(self.request, 'Last-Modified', d_str)
+        self.setHeader(self.request, 'ETag', '"%s"' % (str(md5)))
+        self.setHeader(self.request, 'Content-Length', str(sz))
+
+
+#Content-Type: text/plain
+
+
+        self.setResponseCode(self.request, 200, 'OK')
+        self.finish(self.request)
+
+class cbCopyObject(cbRequest):
+
+    def __init__(self, request, user, requestId, bucketIface, srcBucket, srcObject, dstBucket, dstObject):
+
+        cbRequest.__init__(self, request, user, requestId, bucketIface)
+
+        ndx = dstObject.find("cumulus:/")
+        if ndx >= 0:
+            pycb.log(logging.ERROR, "someone tried to make a key named cumulus://... why would someone do that? %d" % (ndx))
+            raise cbException('InvalidURI')
+
+        self.dstBucketName = dstBucket
+        self.dstObjectName = dstObject
+        self.srcBucketName = srcBucket
+        self.srcObjectName = srcObject
+
+
+    def check_permissions(self):
+        pycb.log(logging.INFO, "===== def check_permissions of cbRequest.py")
+        srcExists = self.user.exists(self.srcBucketName, self.srcObjectName)
+        if not srcExists:
+            raise cbException('NoSuchKey')
+        (perms, src_data_key) = self.user.get_perms(self.srcBucketName, self.srcObjectName)
+        # make sure that we can read the source
+        ndx = perms.find("r")
+        if ndx < 0:
+            raise cbException('AccessDenied')
+
+        # make sure we can write to the destination
+        dstExists = self.user.exists(self.dstBucketName, self.dstObjectName)
+
+        (bperms, bdata_key) = self.user.get_perms(self.dstBucketName)
+        ndx = bperms.find("w")
+        if ndx < 0:
+            raise cbException('AccessDenied')
+
+        dst_data_key = None
+        dst_size = 0
+        if dstExists:
+            (perms, dst_data_key) = self.user.get_perms(self.dstBucketName, self.dstObjectName)
+            ndx = perms.find("w")
+            if ndx < 0:
+                raise cbException('AccessDenied')
+
+            (dst_size, ctm, md5) = self.user.get_info(self.dstBucketName, self.dstObjectName)
+        (src_size, self.src_ctm, self.src_md5) = self.user.get_info(self.srcBucketName, self.srcObjectName)
+
+        # check the quota
+        remaining_quota = self.user.get_remaining_quota()
+        if remaining_quota != User.UNLIMITED:
+            if remaining_quota < src_size - dst_size:
+                pycb.log(logging.INFO, "user %s did not pass quota.  file size %d quota %d" % (self.user, src_size, remaining_quota))
+                raise cbException('AccountProblem')
+
+        # if we get to here we are allowed to do the copy
+        if dst_data_key == None:
+            self.dst_file = self.bucketIface.put_object(self.dstBucketName, self.dstObjectName)
+        else:
+            self.dst_file = self.bucketIface.get_object(dst_data_key)
+        self.dst_file.set_delete_on_close(True)
+        self.src_file = self.bucketIface.get_object(src_data_key) 
+
+    def copy_file(self):
+        pycb.log(logging.INFO, "===== def copy_file of cbRequest.py")
+        try:
+            done = False
+            while not done:
+                b = self.src_file.read()
+                if len(b) > 0:
+                    self.dst_file.write(b)
+                else:
+                    done = True
+
+            self.dst_file.set_delete_on_close(False)
+            self.dst_file.close()
+            reactor.callFromThread(self.end_copy)
+        except cbException, (ex):
+            ex.sendErrorResponse(self.request, self.requestId)
+            traceback.print_exc(file=sys.stdout)
+        except:
+            traceback.print_exc(file=sys.stdout)
+            gdEx = cbException('InvalidArgument')
+            gdEx.sendErrorResponse(self.request, self.requestId)
+
+
+
+    def end_copy(self):
+        pycb.log(logging.INFO, "===== def end_copy of cbRequest.py")
+
+        try:
+            self.user.put_object(self.dst_file, self.dstBucketName, self.dstObjectName)
+            self.grant_public_permissions(self.dstBucketName, self.dstObjectName)
+
+            doc = Document()
+            cor = doc.createElement("CopyObjectResult")
+            doc.appendChild(cor)
+
+            lm = doc.createElement("LastModified")
+            cor.appendChild(lm)
+            lmText = doc.createTextNode(datetime(*self.src_ctm[:6]).isoformat())
+            lm.appendChild(lmText)
+
+            lm = doc.createElement("ETag")
+            cor.appendChild(lm)
+            lmText = doc.createTextNode(str(self.src_md5))
+            lm.appendChild(lmText)
+
+            x = doc.toxml();
+            self.setHeader(self.request, 'x-amz-copy-source-version-id', "1")
+            self.setHeader(self.request, 'x-amz-version-id', "1")
+            self.send_xml(x)
+            self.request.finish()
+
+        except cbException, (ex):
+            ex.sendErrorResponse(self.request, self.requestId)
+            traceback.print_exc(file=sys.stdout)
+        except:
+            traceback.print_exc(file=sys.stdout)
+            gdEx = cbException('InvalidArgument')
+            gdEx.sendErrorResponse(self.request, self.requestId)
+
+
+    def work(self):
+        pycb.log(logging.INFO, "===== def work of cbRequest.py")
+        self.check_permissions()
+
+        reactor.callInThread(self.copy_file)
